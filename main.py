@@ -57,9 +57,10 @@ def _get_tool_calls(ctx: dict, skip_name: str = "") -> list[dict]:
                     "name": name,
                     "arguments": json.dumps(inp, ensure_ascii=False) if isinstance(inp, dict) else str(inp),
                 })
-    # Gemini 格式：parts 中的 functionCall（无 ID，用名称合成）
+    # Gemini 格式：parts 中的 functionCall（无原生 ID，按名称计数合成唯一 ID）
     parts = ctx.get("parts")
     if isinstance(parts, list):
+        name_counts: dict[str, int] = {}
         for p in parts:
             if isinstance(p, dict) and "functionCall" in p:
                 fc = p["functionCall"]
@@ -67,8 +68,10 @@ def _get_tool_calls(ctx: dict, skip_name: str = "") -> list[dict]:
                 if skip_name and name == skip_name:
                     continue
                 args = fc.get("args", {})
+                n = name_counts.get(name, 0)
+                name_counts[name] = n + 1
                 result.append({
-                    "id": f"__gemini__{name}",
+                    "id": f"__gemini__{name}__{n}",
                     "name": name,
                     "arguments": json.dumps(args, ensure_ascii=False) if isinstance(args, dict) else str(args),
                 })
@@ -98,16 +101,19 @@ def _get_tool_results(ctx: dict) -> list[dict]:
                     "call_id": p.get("tool_use_id", ""),
                     "content": res,
                 })
-    # Gemini 格式：user role，parts 中有 functionResponse
+    # Gemini 格式：user role，parts 中有 functionResponse（按名称计数，与 _get_tool_calls 保持一致）
     parts = ctx.get("parts")
     if isinstance(parts, list):
+        name_counts: dict[str, int] = {}
         for p in parts:
             if isinstance(p, dict) and "functionResponse" in p:
                 fr = p["functionResponse"]
                 name = fr.get("name", "")
                 resp = fr.get("response", {})
+                n = name_counts.get(name, 0)
+                name_counts[name] = n + 1
                 result.append({
-                    "call_id": f"__gemini__{name}",
+                    "call_id": f"__gemini__{name}__{n}",
                     "content": json.dumps(resp, ensure_ascii=False) if isinstance(resp, dict) else str(resp),
                 })
     return result
@@ -119,6 +125,14 @@ def _remove_tool_calls(ctx: dict, keep_ids: set) -> dict | None:
     role = ctx.get("role", "")
     content = ctx.get("content")
     parts = ctx.get("parts")
+
+    # 预提取 Gemini keep 名称（支持 __gemini__<name>__<n> 和旧格式 __gemini__<name>）
+    _keep_gemini_names: set[str] = set()
+    for kid in keep_ids:
+        if kid.startswith("__gemini__"):
+            tail = kid[len("__gemini__"):]
+            idx = tail.rfind("__")
+            _keep_gemini_names.add(tail[:idx] if idx > 0 and tail[idx + 2:].isdigit() else tail)
 
     # OpenAI role=tool 消息
     if role == "tool":
@@ -165,7 +179,7 @@ def _remove_tool_calls(ctx: dict, keep_ids: set) -> dict | None:
             new_parts = [
                 p for p in parts
                 if not (isinstance(p, dict) and "functionCall" in p)
-                or f"__gemini__{p['functionCall'].get('name', '')}" in keep_ids
+                or p['functionCall'].get('name', '') in _keep_gemini_names
             ]
             if not new_parts:
                 return None
@@ -177,7 +191,7 @@ def _remove_tool_calls(ctx: dict, keep_ids: set) -> dict | None:
             new_parts = [
                 p for p in parts
                 if not (isinstance(p, dict) and "functionResponse" in p)
-                or f"__gemini__{p['functionResponse'].get('name', '')}" in keep_ids
+                or p['functionResponse'].get('name', '') in _keep_gemini_names
             ]
             if not new_parts:
                 return None
@@ -230,9 +244,18 @@ class ToolUseCleanerPlugin(Star):
         return round_ends
 
     def _extract_tool_records(self, contexts: list[dict], start: int, end: int, round_num: int) -> list[dict]:
-        """从指定范围提取工具调用记录（支持 OpenAI / Anthropic / Gemini）"""
-        tool_calls_map: dict[str, dict] = {}
+        """从指定范围提取工具调用记录（支持 OpenAI / Anthropic / Gemini）。
+        使用列表 + 首条未匹配策略，避免 ID 碰撞（适用于 Gemini 合成 ID、空 ID 等情况）。"""
+        tool_calls_list: list[dict] = []
         last_user_msg = ""
+
+        def _match_result(call_id: str, content: str):
+            """将结果写入第一条 call_id 相同且尚无结果的调用记录"""
+            for record in tool_calls_list:
+                if record["tool_call_id"] == call_id and record["result"] is None:
+                    record["result"] = content
+                    return
+
         for i in range(start, min(end + 1, len(contexts))):
             ctx = contexts[i]
             role = _norm_role(ctx)
@@ -241,30 +264,26 @@ class ToolUseCleanerPlugin(Star):
                 text = _get_text(ctx)
                 if text:
                     last_user_msg = text
-                # 匹配工具返回结果
+                # Anthropic / Gemini 结果在 user 消息中
                 for res in _get_tool_results(ctx):
-                    cid = res["call_id"]
-                    if cid in tool_calls_map:
-                        tool_calls_map[cid]["result"] = res["content"]
+                    _match_result(res["call_id"], res["content"])
 
             elif role == "assistant":
                 for call in _get_tool_calls(ctx, skip_name="query_compressed_tools"):
-                    tool_calls_map[call["id"]] = {
+                    tool_calls_list.append({
                         "tool_name": call["name"],
                         "tool_call_id": call["id"],
                         "arguments": call["arguments"],
                         "result": None,
                         "user_query": last_user_msg,
                         "round_num": round_num,
-                    }
+                    })
 
-            # OpenAI role=tool 结果
+            # OpenAI role=tool 结果（_get_tool_results 对非 tool role 返回空列表，不影响其他格式）
             for res in _get_tool_results(ctx):
-                cid = res["call_id"]
-                if cid in tool_calls_map:
-                    tool_calls_map[cid]["result"] = res["content"]
+                _match_result(res["call_id"], res["content"])
 
-        return list(tool_calls_map.values())
+        return tool_calls_list
 
     def _clean_contexts(self, contexts: list[dict], keep_ids: set) -> list[dict]:
         """对上下文列表执行工具调用清理"""
@@ -313,12 +332,6 @@ class ToolUseCleanerPlugin(Star):
         logger.info(f"[压缩器] 第{current_round}轮 | filter 触发，上下文共 {ctx_count} 条")
 
         if not req.contexts:
-            # 检测到上下文被清空（如 AstrBot /reset 命令），自动清理本插件缓存
-            count = len(self.compressed_records.get(session_id, []))
-            if count > 0:
-                del self.compressed_records[session_id]
-                self.round_counter[session_id] = 0
-                logger.info(f"[压缩器] 第{current_round}轮 | 检测到会话上下文被清空，已自动清理 {count} 条缓存记录")
             return
 
         try:
@@ -389,9 +402,10 @@ class ToolUseCleanerPlugin(Star):
 
     @filter.llm_tool(name="query_compressed_tools")
     async def query_compressed_tools(self, event: AstrMessageEvent, tool_name: str = ""):
-        '''你在会话中的历史调用工具记录将会被压缩删除。此工具用于查询当前会话中被压缩的历史工具调用记录，包括触发工具的消息、调用参数和返回结果。当你需要查看会话中的历史工具调用记录时，请调用此工具。
+        '''你在会话中的历史调用工具记录将会被压缩删除。此工具用于查询当前会话中被压缩的历史工具调用记录。当你需要查看历史工具调用记录时，请调用此工具。
 
-            tool_name(string): 工具名称。传空字符串""或不传返回所有工具的调用概览；传具体工具名称返回该工具的详细调用记录。注意：本工具只接受 tool_name 这一个参数，传入其他参数名（如 query、search、name 等）将被框架忽略。
+        Args:
+            tool_name(string): 工具名称。传空字符串或不传返回所有工具的调用概览；传具体工具名称返回该工具的详细调用记录（包含调用参数和返回结果）。
         '''
         session_id = event.unified_msg_origin
         records = self.compressed_records.get(session_id, [])
@@ -400,18 +414,15 @@ class ToolUseCleanerPlugin(Star):
             return "当前会话没有被压缩的历史工具调用记录。若会话刚开始或尚未发生工具调用，这是正常的。"
 
         if not tool_name:
-            # 空传或参数名错误被框架忽略后走此分支，均返回概览并给出参数提醒
             summary: dict[str, int] = {}
             for r in records:
                 summary[r["tool_name"]] = summary.get(r["tool_name"], 0) + 1
             lines = [
-                "⚠ 参数提醒：本工具只接受 tool_name 参数。若你传入了 query/search/name 等其他参数名，框架会将其忽略并使用默认值（空字符串），导致只返回概览而非详细记录。",
-                "",
                 f"当前会话共压缩了 {len(records)} 条历史工具调用记录，涉及以下工具：",
             ]
             for name, cnt in summary.items():
                 lines.append(f"  - {name}（{cnt} 次）")
-            lines.append("\n如需查看某工具的详细调用参数和返回结果，请将上方工具名作为参数再次调用本工具。")
+            lines.append("\n如需查看某工具的详细调用记录（包含参数和返回结果），请将工具名称作为 tool_name 参数再次调用本工具。")
             return "\n".join(lines)
 
         matched = [r for r in records if r["tool_name"] == tool_name]
@@ -437,6 +448,17 @@ class ToolUseCleanerPlugin(Star):
                 result_str = result_str[:500] + "…（已截断）"
             lines.append(f"返回结果：{result_str}")
         return "\n".join(lines)
+
+    @filter.after_message_sent()
+    async def on_session_cleared(self, event: AstrMessageEvent):
+        """跟随系统 /reset 清空本插件的压缩记录缓存"""
+        if event.get_extra("_clean_ltm_session", False):
+            session_id = event.unified_msg_origin
+            count = len(self.compressed_records.get(session_id, []))
+            if count > 0:
+                del self.compressed_records[session_id]
+            self.round_counter[session_id] = 0
+            logger.info(f"[压缩器] 检测到会话清空标记，已清理 {session_id} 的 {count} 条缓存记录")
 
     async def terminate(self):
         self.compressed_records.clear()
