@@ -199,7 +199,6 @@ class ToolUseCleanerPlugin(Star):
         self.config = config
         self.tool_context_keep_rounds = int(self.config.get("tool_context_keep_rounds", 0))
         self.compressed_keep_rounds = int(self.config.get("compressed_record_keep_rounds", 0))
-        self.reset_keywords: list[str] = self.config.get("session_reset_keywords", ["reset", "/reset", "clear", "/clear", "重置会话", "清空上下文", "新对话"])
         self.compressed_records: dict[str, list[dict]] = defaultdict(list)
         self.round_counter: dict[str, int] = defaultdict(int)
         keep_str = "全部清除" if self.tool_context_keep_rounds <= 0 else f"保留最近{self.tool_context_keep_rounds}轮"
@@ -314,6 +313,12 @@ class ToolUseCleanerPlugin(Star):
         logger.info(f"[压缩器] 第{current_round}轮 | filter 触发，上下文共 {ctx_count} 条")
 
         if not req.contexts:
+            # 检测到上下文被清空（如 AstrBot /reset 命令），自动清理本插件缓存
+            count = len(self.compressed_records.get(session_id, []))
+            if count > 0:
+                del self.compressed_records[session_id]
+                self.round_counter[session_id] = 0
+                logger.info(f"[压缩器] 第{current_round}轮 | 检测到会话上下文被清空，已自动清理 {count} 条缓存记录")
             return
 
         try:
@@ -333,7 +338,7 @@ class ToolUseCleanerPlugin(Star):
                 for ctx in req.contexts
             )
             has_tool_role = any(ctx.get("role") == "tool" for ctx in req.contexts)
-            logger.debug(
+            logger.info(
                 f"[压缩器] 第{current_round}轮 上下文{original_count}条 "
                 f"角色={roles[:12]} "
                 f"格式: openai={has_openai} anthropic={has_anthropic} gemini={has_gemini} tool_role={has_tool_role}"
@@ -368,33 +373,19 @@ class ToolUseCleanerPlugin(Star):
             self._trim_records_by_rounds(session_id, current_round)
 
             removed_count = original_count - len(req.contexts)
-            cached_total = len(self.compressed_records.get(session_id, []))
-            cached_names = ", ".join(sorted({r["tool_name"] for r in self.compressed_records.get(session_id, [])})) or "无"
-            if self.compressed_keep_rounds == 0:
-                expire_str = "不保留（0轮，立即淘汰）"
+            if removed_count > 0:
+                cached_total = len(self.compressed_records.get(session_id, []))
+                cached_names = ", ".join(sorted({r["tool_name"] for r in self.compressed_records.get(session_id, [])})) or "无"
+                expire_str = "不保留（0轮，立即淘汰）" if self.compressed_keep_rounds == 0 else f"{self.compressed_keep_rounds}轮后过期"
+                logger.info(
+                    f"[压缩器] 第{current_round}轮 | "
+                    f"已清除 {removed_count} 条 tool_call/result 消息并缓存 | "
+                    f"历史记录共 {cached_total} 条（{cached_names}），{expire_str}"
+                )
             else:
-                expire_str = f"{self.compressed_keep_rounds}轮后过期"
-            logger.info(
-                f"[压缩器] 第{current_round}轮 | "
-                f"已清除 {removed_count} 条 tool_call/result 消息并缓存入历史记录 | "
-                f"历史记录中共 {cached_total} 条（{cached_names}），{expire_str}"
-            )
+                logger.debug(f"[压缩器] 第{current_round}轮 | 上下文无工具调用消息，跳过")
         except Exception as e:
             logger.error(f"[压缩器] 第{current_round}轮处理出错：{e}", exc_info=True)
-
-    @filter.event_message_type(filter.EventMessageType.ALL)
-    async def detect_reset(self, event: AstrMessageEvent):
-        """检测重置关键词，清空该会话的压缩记录缓存（不拦截消息）"""
-        msg = event.message_str.strip()
-        session_id = event.unified_msg_origin
-        for keyword in self.reset_keywords:
-            if keyword and msg == keyword:
-                if session_id in self.compressed_records:
-                    count = len(self.compressed_records[session_id])
-                    del self.compressed_records[session_id]
-                    self.round_counter[session_id] = 0
-                    logger.info(f"[压缩器] 关键词 '{keyword}' 触发重置，会话...{session_id[-12:]} 清空 {count} 条记录")
-                break
 
     @filter.llm_tool(name="query_compressed_tools")
     async def query_compressed_tools(self, event: AstrMessageEvent, tool_name: str = ""):

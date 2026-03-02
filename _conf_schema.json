@@ -10,10 +10,5 @@
     "description": "历史工具调用记录缓存保留最近N轮（0表示不保留，立即淘汰；N表示最多保留最近N轮的记录）",
     "default": 15,
     "min": 0
-  },
-  "session_reset_keywords": {
-    "type": "list",
-    "description": "触发清空压缩记录缓存的会话重置关键词列表（严格匹配用户消息，不拦截消息传播）",
-    "default": ["reset", "/reset", "clear", "/clear", "重置会话", "清空上下文", "新对话"]
   }
 }
