@@ -182,7 +182,7 @@ class ToolUseCleanerPlugin(Star):
         # 不调用 event.stop_event()，让消息继续传播
 
     @filter.llm_tool(name="query_compressed_tools")
-    async def query_compressed_tools(self, event: AstrMessageEvent, tool_name: str):
+    async def query_compressed_tools(self, event: AstrMessageEvent, tool_name: str = ""):
         '''你在会话中的历史调用工具记录将会被压缩删除。此工具用于查询当前会话中被压缩的历史工具调用记录，包括触发工具的消息、调用参数和返回结果。当你需要查看会话中的历史工具调用记录时，请调用此工具。    
         
             tool_name(string): 工具名称，传空字符串""返回概览，传具体名称返回详细记录
