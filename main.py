@@ -356,6 +356,10 @@ class ToolUseCleanerPlugin(Star):
                 f"角色={roles[:12]} "
                 f"格式: openai={has_openai} anthropic={has_anthropic} gemini={has_gemini} tool_role={has_tool_role}"
             )
+            # 诊断：打印每条消息的顶层字段名，帮助识别实际格式
+            for _i, _ctx in enumerate(req.contexts):
+                _keys = list(_ctx.keys())
+                logger.debug(f"[压缩器] ctx[{_i}] role={_ctx.get('role','?')} keys={_keys}")
 
             self_tool_ids = self._collect_self_tool_ids(req.contexts)
             newly_cached = 0
@@ -423,7 +427,7 @@ class ToolUseCleanerPlugin(Star):
             for name, cnt in summary.items():
                 lines.append(f"  - {name}（{cnt} 次）")
             lines.append("\n如需查看某工具的详细调用记录（包含参数和返回结果），请将工具名称作为 tool_name 参数再次调用本工具。")
-            lines.append("⚠ 若你本意是查询某工具的详细记录却看到了此概览，请检查是否使用了正确的参数名 tool_name（传入 name、query 等其他参数名会被框架忽略）。")
+            lines.append("⚠ 若你本意是查询某工具的详细记录却看到了此概览，请检查是否使用了正确的请求结构 tool_name:你要查询的name")
             return "\n".join(lines)
 
         matched = [r for r in records if r["tool_name"] == tool_name]
