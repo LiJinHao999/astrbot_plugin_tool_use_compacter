@@ -7,8 +7,8 @@
   },
   "compressed_record_keep_rounds": {
     "type": "int",
-    "description": "压缩记录缓存保留最近N轮的工具调用记录供LLM查询（0表示不限制）",
-    "default": 0,
+    "description": "压缩记录缓存保留最近N轮的工具调用记录供LLM查询（0表示不限制缓存记录）",
+    "default": 15,
     "min": 0
   },
   "session_reset_keywords": {

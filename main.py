@@ -17,7 +17,9 @@ class ToolUseCleanerPlugin(Star):
         self.compressed_records: dict[str, list[dict]] = defaultdict(list)
         # 每个会话的请求轮次计数器
         self.round_counter: dict[str, int] = defaultdict(int)
-        logger.info(f"工具调用压缩插件已初始化，上下文保留{self.tool_context_keep_rounds}轮，压缩缓存保留{self.compressed_keep_rounds}轮")
+        keep_str = "全部清除" if self.tool_context_keep_rounds <= 0 else f"保留最近{self.tool_context_keep_rounds}轮"
+        cache_str = "不限轮数" if self.compressed_keep_rounds <= 0 else f"最近{self.compressed_keep_rounds}轮"
+        logger.info(f"[压缩器] 插件已初始化：上下文工具调用{keep_str}，压缩缓存保留{cache_str}")
 
     def _find_round_ends(self, contexts: list[dict]) -> list[int]:
         """找到所有轮次的结束位置索引（assistant->user/system 转换点）"""
@@ -59,7 +61,7 @@ class ToolUseCleanerPlugin(Star):
         return list(tool_calls_map.values())
 
     def _store_records(self, session_id: str, records: list[dict]):
-        """存储压缩记录，按 tool_call_id 去重，按轮数限制淘汰"""
+        """存储压缩记录，按 tool_call_id 去重"""
         if not records:
             return
         existing_ids = {r["tool_call_id"] for r in self.compressed_records[session_id]}
@@ -67,16 +69,21 @@ class ToolUseCleanerPlugin(Star):
         if not new_records:
             return
         self.compressed_records[session_id].extend(new_records)
-        logger.debug(f"会话 {session_id} 新增 {len(new_records)} 条压缩记录")
+        total = len(self.compressed_records[session_id])
+        logger.info(f"[压缩器] 会话 ...{session_id[-12:]} 新增 {len(new_records)} 条压缩记录，累计 {total} 条")
 
     def _trim_records_by_rounds(self, session_id: str):
         """按轮数限制淘汰过旧的压缩记录"""
         if self.compressed_keep_rounds <= 0 or not self.compressed_records[session_id]:
             return
         cutoff = self.round_counter[session_id] - self.compressed_keep_rounds
+        before = len(self.compressed_records[session_id])
         self.compressed_records[session_id] = [
             r for r in self.compressed_records[session_id] if r["round_num"] > cutoff
         ]
+        trimmed = before - len(self.compressed_records[session_id])
+        if trimmed > 0:
+            logger.debug(f"[压缩器] 会话 ...{session_id[-12:]} 淘汰 {trimmed} 条旧记录，剩余 {len(self.compressed_records[session_id])} 条")
 
     @filter.on_llm_request()
     async def clean_context(self, event: AstrMessageEvent, req: ProviderRequest):
@@ -99,7 +106,7 @@ class ToolUseCleanerPlugin(Star):
                         self_tool_ids.add(tc.get("id", ""))
 
         if self.tool_context_keep_rounds <= 0:
-            # 提取全部工具调用记录后清除
+            # 全部清除模式：提取全量工具调用后清除
             records = self._extract_tool_records(req.contexts, 0, len(req.contexts) - 1, current_round)
             self._store_records(session_id, records)
 
@@ -111,7 +118,6 @@ class ToolUseCleanerPlugin(Star):
                     continue
                 if ctx.get("role") == "assistant":
                     if "tool_calls" in ctx:
-                        # 保留自身工具的 tool_calls，移除其他的
                         self_calls = [tc for tc in ctx["tool_calls"] if tc.get("id") in self_tool_ids]
                         other_calls = [tc for tc in ctx["tool_calls"] if tc.get("id") not in self_tool_ids]
                         if other_calls and not ctx.get("content") and not self_calls:
@@ -128,13 +134,19 @@ class ToolUseCleanerPlugin(Star):
                 cleaned_contexts.append(ctx)
             req.contexts = cleaned_contexts
         else:
-            # 按轮次控制清理范围
+            # 保留N轮模式：只清理超出范围的旧轮次
+            # 修复：需保留最近 K 轮，当历史轮数 <= K 时无需清理
+            # 当历史轮数 > K 时，清理到第 (N-K-1) 个 round_end（即保留后K轮）
             cutoff_index = -1
             if round_ends:
-                if len(round_ends) < self.tool_context_keep_rounds:
-                    cutoff_index = round_ends[0]
+                if len(round_ends) <= self.tool_context_keep_rounds:
+                    # 历史轮数不超过保留限制，无需清理
+                    cutoff_index = -1
+                    logger.debug(f"[压缩器] 会话 ...{session_id[-12:]} 第{current_round}轮：共{len(round_ends)}轮 ≤ 保留{self.tool_context_keep_rounds}轮，跳过清理")
                 else:
-                    cutoff_index = round_ends[-self.tool_context_keep_rounds]
+                    # 清理最旧的 (N-K) 轮，保留最新 K 轮
+                    cutoff_index = round_ends[-(self.tool_context_keep_rounds + 1)]
+                    logger.debug(f"[压缩器] 会话 ...{session_id[-12:]} 第{current_round}轮：共{len(round_ends)}轮，保留{self.tool_context_keep_rounds}轮，清理到索引{cutoff_index}")
 
             if cutoff_index >= 0:
                 records = self._extract_tool_records(req.contexts, 0, cutoff_index, current_round)
@@ -163,8 +175,11 @@ class ToolUseCleanerPlugin(Star):
         self._trim_records_by_rounds(session_id)
 
         removed_count = original_count - len(req.contexts)
+        cached_total = len(self.compressed_records.get(session_id, []))
         if removed_count > 0:
-            logger.info(f"上下文压缩: 移除了 {removed_count} 条消息，记录已缓存")
+            logger.info(f"[压缩器] 会话 ...{session_id[-12:]} 第{current_round}轮：上下文 {original_count}→{len(req.contexts)} 条（移除{removed_count}条），缓存共{cached_total}条")
+        else:
+            logger.debug(f"[压缩器] 会话 ...{session_id[-12:]} 第{current_round}轮：无工具调用需压缩（{original_count}条），缓存共{cached_total}条")
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def detect_reset(self, event: AstrMessageEvent):
@@ -177,50 +192,56 @@ class ToolUseCleanerPlugin(Star):
                     count = len(self.compressed_records[session_id])
                     del self.compressed_records[session_id]
                     self.round_counter[session_id] = 0
-                    logger.info(f"检测到重置关键词 '{keyword}'，已清空会话 {session_id} 的 {count} 条压缩记录")
+                    logger.info(f"[压缩器] 检测到重置关键词 '{keyword}'，已清空会话 ...{session_id[-12:]} 的 {count} 条压缩记录")
                 break
         # 不调用 event.stop_event()，让消息继续传播
 
     @filter.llm_tool(name="query_compressed_tools")
     async def query_compressed_tools(self, event: AstrMessageEvent, tool_name: str = ""):
-        '''你在会话中的历史调用工具记录将会被压缩删除。此工具用于查询当前会话中被压缩的历史工具调用记录，包括触发工具的消息、调用参数和返回结果。当你需要查看会话中的历史工具调用记录时，请调用此工具。    
-        
-            tool_name(string): 工具名称，传空字符串""返回概览，传具体名称返回详细记录
+        '''你在会话中的历史调用工具记录将会被压缩删除。此工具用于查询当前会话中被压缩的历史工具调用记录，包括触发工具的消息、调用参数和返回结果。当你需要查看会话中的历史工具调用记录时，请调用此工具。
+
+            tool_name(string): 工具名称，传空字符串""返回所有工具的调用概览，传具体工具名称返回该工具的详细调用记录
         '''
         session_id = event.unified_msg_origin
         records = self.compressed_records.get(session_id, [])
 
         if not records:
-            yield event.plain_result("当前会话没有被压缩的工具调用记录。")
-            return
+            return "当前会话没有被压缩的历史工具调用记录。（若会话刚开始或未发生过工具调用，这是正常现象）"
 
         if not tool_name:
-            summary = {}
+            # 空传或参数不匹配时均返回概览（防呆）
+            summary: dict[str, int] = {}
             for r in records:
-                name = r["tool_name"]
-                summary[name] = summary.get(name, 0) + 1
+                summary[r["tool_name"]] = summary.get(r["tool_name"], 0) + 1
             lines = [f"当前会话共有 {len(records)} 条被压缩的历史工具调用记录："]
-            for name, count in summary.items():
-                lines.append(f"- {name}: {count} 次调用")
-            lines.append("\n可通过传入具体工具名查询详细的调用参数和返回结果。")
-            yield event.plain_result("\n".join(lines))
-        else:
-            matched = [r for r in records if r["tool_name"] == tool_name]
-            if not matched:
-                yield event.plain_result(f"未找到工具 '{tool_name}' 的压缩记录。")
-                return
-            lines = [f"工具 '{tool_name}' 共有 {len(matched)} 条压缩记录："]
-            for i, r in enumerate(matched, 1):
-                lines.append(f"\n--- 记录 {i} ---")
-                lines.append(f"用户发送过请求: {r['user_query']}")
-                lines.append(f"你在那时候调用了工具: {r['arguments']}")
-                result_str = str(r["result"] or "")
-                if len(result_str) > 500:
-                    result_str = result_str[:500] + "...(截断)"
-                lines.append(f"返回结果: {result_str}")
-            yield event.plain_result("\n".join(lines))
+            for name, cnt in summary.items():
+                lines.append(f"- {name}: {cnt} 次")
+            lines.append("\n如需查看某工具的详细调用参数和返回结果，请将该工具名称作为 tool_name 参数再次调用本工具。")
+            return "\n".join(lines)
+
+        matched = [r for r in records if r["tool_name"] == tool_name]
+        if not matched:
+            # 防呆：名称不存在时，返回警告 + 概览
+            available = sorted({r["tool_name"] for r in records})
+            summary_lines = [f"⚠ 未找到工具 '{tool_name}' 的压缩记录，以下是当前有记录的工具："]
+            for name in available:
+                cnt = sum(1 for r in records if r["tool_name"] == name)
+                summary_lines.append(f"- {name}: {cnt} 次")
+            summary_lines.append("\n请使用上述工具名之一作为 tool_name 参数重新查询。")
+            return "\n".join(summary_lines)
+
+        lines = [f"工具 '{tool_name}' 共有 {len(matched)} 条压缩记录："]
+        for i, r in enumerate(matched, 1):
+            lines.append(f"\n--- 记录 {i} ---")
+            lines.append(f"触发请求: {r['user_query']}")
+            lines.append(f"调用参数: {r['arguments']}")
+            result_str = str(r["result"] or "（无结果）")
+            if len(result_str) > 500:
+                result_str = result_str[:500] + "...(已截断)"
+            lines.append(f"返回结果: {result_str}")
+        return "\n".join(lines)
 
     async def terminate(self):
         """插件卸载时清理缓存"""
         self.compressed_records.clear()
-        logger.info("工具调用压缩插件已卸载")
+        logger.info("[压缩器] 插件已卸载，缓存已清理")
