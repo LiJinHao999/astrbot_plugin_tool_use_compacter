@@ -302,7 +302,7 @@ class ToolUseCleanerPlugin(Star):
         if trimmed > 0:
             logger.debug(f"[压缩器] 淘汰 {trimmed} 条过期缓存记录（超过 {self.compressed_keep_rounds} 轮），剩余 {len(self.compressed_records[session_id])} 条")
 
-    @filter.on_llm_request()
+    @filter.on_llm_request(priority=-1)
     async def clean_context(self, event: AstrMessageEvent, req: ProviderRequest):
         """压缩上下文中的工具调用：提取记录到缓存后从请求体中移除"""
         session_id = event.unified_msg_origin
