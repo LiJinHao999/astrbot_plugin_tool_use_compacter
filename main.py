@@ -306,75 +306,81 @@ class ToolUseCleanerPlugin(Star):
     @filter.on_llm_request()
     async def clean_context(self, event: AstrMessageEvent, req: ProviderRequest):
         """压缩上下文中的工具调用：提取记录到缓存后从请求体中移除"""
-        if not req.contexts:
-            return
-
         session_id = event.unified_msg_origin
-        original_count = len(req.contexts)
-        # 0-indexed：第0轮为该会话的第一次 LLM 请求
         current_round = self.round_counter[session_id]
         self.round_counter[session_id] += 1
 
-        # 诊断日志：记录格式信息
-        roles = [ctx.get("role", "?") for ctx in req.contexts]
-        has_openai = any(ctx.get("tool_calls") for ctx in req.contexts)
-        has_anthropic = any(
-            isinstance(ctx.get("content"), list) and
-            any(isinstance(p, dict) and p.get("type") in ("tool_use", "tool_result") for p in ctx["content"])
-            for ctx in req.contexts
-        )
-        has_gemini = any(
-            isinstance(ctx.get("parts"), list) and
-            any(isinstance(p, dict) and ("functionCall" in p or "functionResponse" in p) for p in ctx["parts"])
-            for ctx in req.contexts
-        )
-        has_tool_role = any(ctx.get("role") == "tool" for ctx in req.contexts)
-        logger.debug(
-            f"[压缩器] 第{current_round}轮 上下文{original_count}条 "
-            f"角色={roles[:12]} "
-            f"格式: openai={has_openai} anthropic={has_anthropic} gemini={has_gemini} tool_role={has_tool_role}"
-        )
+        ctx_count = len(req.contexts) if req.contexts else 0
+        logger.info(f"[压缩器] 第{current_round}轮 | filter 触发，上下文共 {ctx_count} 条")
 
-        self_tool_ids = self._collect_self_tool_ids(req.contexts)
-        newly_cached = 0
+        if not req.contexts:
+            return
 
-        if self.tool_context_keep_rounds <= 0:
-            # 全部清除模式
-            records = self._extract_tool_records(req.contexts, 0, len(req.contexts) - 1, current_round)
-            newly_cached = self._store_records(session_id, records)
-            req.contexts = self._clean_contexts(req.contexts, self_tool_ids)
-        else:
-            # 保留N轮模式
-            round_ends = self._find_round_ends(req.contexts)
-            cutoff_index = -1
-            if round_ends:
-                if len(round_ends) <= self.tool_context_keep_rounds:
-                    logger.debug(f"[压缩器] 共{len(round_ends)}轮 ≤ 保留{self.tool_context_keep_rounds}轮，跳过清理")
-                else:
-                    cutoff_index = round_ends[-(self.tool_context_keep_rounds + 1)]
-                    logger.debug(f"[压缩器] 共{len(round_ends)}轮，保留{self.tool_context_keep_rounds}轮，清理到索引{cutoff_index}")
+        try:
+            original_count = len(req.contexts)
 
-            if cutoff_index >= 0:
-                records = self._extract_tool_records(req.contexts, 0, cutoff_index, current_round)
+            # 诊断日志：记录格式信息
+            roles = [ctx.get("role", "?") for ctx in req.contexts]
+            has_openai = any(ctx.get("tool_calls") for ctx in req.contexts)
+            has_anthropic = any(
+                isinstance(ctx.get("content"), list) and
+                any(isinstance(p, dict) and p.get("type") in ("tool_use", "tool_result") for p in ctx["content"])
+                for ctx in req.contexts
+            )
+            has_gemini = any(
+                isinstance(ctx.get("parts"), list) and
+                any(isinstance(p, dict) and ("functionCall" in p or "functionResponse" in p) for p in ctx["parts"])
+                for ctx in req.contexts
+            )
+            has_tool_role = any(ctx.get("role") == "tool" for ctx in req.contexts)
+            logger.debug(
+                f"[压缩器] 第{current_round}轮 上下文{original_count}条 "
+                f"角色={roles[:12]} "
+                f"格式: openai={has_openai} anthropic={has_anthropic} gemini={has_gemini} tool_role={has_tool_role}"
+            )
+
+            self_tool_ids = self._collect_self_tool_ids(req.contexts)
+            newly_cached = 0
+
+            if self.tool_context_keep_rounds <= 0:
+                # 全部清除模式
+                records = self._extract_tool_records(req.contexts, 0, len(req.contexts) - 1, current_round)
                 newly_cached = self._store_records(session_id, records)
-                pre = req.contexts[:cutoff_index + 1]
-                post = req.contexts[cutoff_index + 1:]
-                req.contexts = self._clean_contexts(pre, self_tool_ids) + post
+                req.contexts = self._clean_contexts(req.contexts, self_tool_ids)
+            else:
+                # 保留N轮模式
+                round_ends = self._find_round_ends(req.contexts)
+                cutoff_index = -1
+                if round_ends:
+                    if len(round_ends) <= self.tool_context_keep_rounds:
+                        logger.debug(f"[压缩器] 共{len(round_ends)}轮 ≤ 保留{self.tool_context_keep_rounds}轮，跳过清理")
+                    else:
+                        cutoff_index = round_ends[-(self.tool_context_keep_rounds + 1)]
+                        logger.debug(f"[压缩器] 共{len(round_ends)}轮，保留{self.tool_context_keep_rounds}轮，清理到索引{cutoff_index}")
 
-        self._trim_records_by_rounds(session_id, current_round)
+                if cutoff_index >= 0:
+                    records = self._extract_tool_records(req.contexts, 0, cutoff_index, current_round)
+                    newly_cached = self._store_records(session_id, records)
+                    pre = req.contexts[:cutoff_index + 1]
+                    post = req.contexts[cutoff_index + 1:]
+                    req.contexts = self._clean_contexts(pre, self_tool_ids) + post
 
-        removed_count = original_count - len(req.contexts)
-        cached_total = len(self.compressed_records.get(session_id, []))
-        cached_names = ", ".join(sorted({r["tool_name"] for r in self.compressed_records.get(session_id, [])})) or "无"
-        if self.compressed_keep_rounds == 0:
-            expire_str = "不保留（0轮，立即淘汰）"
-        else:
-            expire_str = f"{self.compressed_keep_rounds}轮后过期"
-        logger.info(
-            f"[压缩器] 第{current_round}轮 | "
-            f"已清除 {removed_count} 条 tool_call/result 消息并缓存入历史记录 | "
-            f"历史记录中共 {cached_total} 条（{cached_names}），{expire_str}"
-        )
+            self._trim_records_by_rounds(session_id, current_round)
+
+            removed_count = original_count - len(req.contexts)
+            cached_total = len(self.compressed_records.get(session_id, []))
+            cached_names = ", ".join(sorted({r["tool_name"] for r in self.compressed_records.get(session_id, [])})) or "无"
+            if self.compressed_keep_rounds == 0:
+                expire_str = "不保留（0轮，立即淘汰）"
+            else:
+                expire_str = f"{self.compressed_keep_rounds}轮后过期"
+            logger.info(
+                f"[压缩器] 第{current_round}轮 | "
+                f"已清除 {removed_count} 条 tool_call/result 消息并缓存入历史记录 | "
+                f"历史记录中共 {cached_total} 条（{cached_names}），{expire_str}"
+            )
+        except Exception as e:
+            logger.error(f"[压缩器] 第{current_round}轮处理出错：{e}", exc_info=True)
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def detect_reset(self, event: AstrMessageEvent):
