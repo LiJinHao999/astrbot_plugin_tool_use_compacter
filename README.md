@@ -16,8 +16,8 @@
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |-------|------|-------|------|
-| tool_context_keep_rounds | int | 0 | 上下文中保留最近 N 轮的工具调用信息（0=全部清除） |
-| compressed_record_keep_rounds | int | 0 | 压缩缓存保留最近 N 轮的记录供 LLM 查询（0=不限制） |
+| tool_context_keep_rounds | int | 1 | 上下文中保留最近 N 轮的工具调用信息（0=全部清除） |
+| compressed_record_keep_rounds | int | 15 | 压缩缓存保留最近 N 轮的记录供 LLM 查询（0=不限制） |
 | session_reset_keywords | list | ["reset","/reset","clear","/clear","重置会话", "清空上下文", "新对话"] | 触发清空压缩缓存的关键词列表 |
 
 ## 安装
